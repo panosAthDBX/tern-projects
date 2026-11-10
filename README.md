@@ -22,11 +22,9 @@ tern plugin install github.com/thegeneralist01/tern-projects
 
 *(Or open **Projects** from the Tern command palette).*
 
-Tern fetches the plugin, and the background engine builds automatically on first load. Rust/Cargo and your platform's native C build tools are required; no manual compile step is needed.
+This local macOS installation uses the native mbx Cargo shim and `~/.local/bin/mbx-check`. The background engine builds automatically into the checkout's managed `indexer/target/release/tern-projects`; plugin data stores only its source fingerprint. Missing managed output is rebuilt on demand, never copied into plugin-data or `bin/`. Other platforms fail explicitly on this local branch.
 
-Cargo discovery checks absolute entries in Tern's host `PATH` first, then `$CARGO_HOME/bin` (or `~/.cargo/bin`) and common Unix installation locations, including Homebrew. The build environment includes the resolved Cargo directory so `rustc` and sibling tools remain available even when the GUI host has a limited `PATH`.
-
-On macOS, install Apple developer tools (`xcode-select --install` if needed) or select your Xcode installation. Automatic builds use the SDK selected by `xcrun --sdk macosx` and Apple's compiler/linker, rather than mixing an unrelated `cc` from `PATH` with a different SDK.
+The backend resolves the physical workspace before admission and Cargo, including when Tern loads a linked checkout. Builds use the SDK selected by `xcrun --sdk macosx` and Apple's compiler/linker. Keep this checkout linked and automatic installation off: the source-ignore library upgrade is forward-only, and official releases must support schema v3 before replacing it.
 
 ### Updates
 

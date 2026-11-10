@@ -1,11 +1,13 @@
 --!strict
--- Build in plugin data, never in the watched/replaced package directory.
+-- Local macOS install: build through the mbx-managed Cargo shim into the
+-- indexer's own target; plugin data holds only the source fingerprint stamp.
 local backend = {}
 local building = false
 local ready: string? = nil
 local waiters: { (string?, string?) -> () } = {}
 local root = tern.plugin.data .. "/backend"
-local executable = root .. "/release/tern-projects" .. (tern.runtime.os == "windows" and ".exe" or "")
+local indexer = tern.plugin.dir .. "/indexer"
+local executable = indexer .. "/target/release/tern-projects"
 
 local function diagnostics(output: string): string
 	local errors = {}
@@ -18,7 +20,7 @@ local function diagnostics(output: string): string
 end
 
 local function inputs(): string
-	local files = { "indexer/Cargo.toml", "indexer/Cargo.lock" }
+	local files = { "lib/backend.luau", "indexer/Cargo.toml", "indexer/Cargo.lock" }
 	local function visit(dir: string)
 		for _, name in tern.fs.list(tern.plugin.dir .. "/" .. dir) do
 			local path = dir .. "/" .. name
@@ -44,8 +46,15 @@ function backend.status(): string?
 end
 
 function backend.ensure(cb: (string?, string?) -> ())
-	if ready then cb(ready, nil); return end
+	-- mbx may evict the managed target; rebuild rather than hand out a missing binary.
+	if ready and tern.fs.exists(ready) then cb(ready, nil); return end
+	ready = nil
 	if building then table.insert(waiters, cb); return end
+	local home = tern.getenv("HOME") or ""
+	if tern.runtime.os ~= "macos" or home == "" then
+		cb(nil, "This installation builds the backend only on macOS with HOME set (mbx-managed Cargo).")
+		return
+	end
 	local ok, source = pcall(inputs)
 	if not ok then cb(nil, "Cannot read backend sources: " .. tostring(source)); return end
 	local cached, stamp = pcall(tern.fs.read, root .. "/inputs.json")
@@ -54,6 +63,25 @@ function backend.ensure(cb: (string?, string?) -> ())
 		cb(ready, nil)
 		return
 	end
+	local shimDir = home .. "/Library/Application Support/mbx/bin"
+	local localBin = home .. "/.local/bin"
+	local cargo = shimDir .. "/cargo"
+	local check = localBin .. "/mbx-check"
+	for _, tool in { cargo, check } do
+		if not tern.fs.exists(tool) then
+			cb(nil, "Missing mbx tool " .. tool .. ". Install mbx, then Refresh to retry.")
+			return
+		end
+	end
+	-- `tern.process.run` extends the inherited environment with `env`.
+	-- mbx must also find rustup's real Cargo when the GUI host PATH omits it.
+	local cargoHome = tern.getenv("CARGO_HOME") or (home .. "/.cargo")
+	local pathEntries = { shimDir, localBin, cargoHome .. "/bin" }
+	local currentPath = tern.getenv("PATH") or ""
+	if currentPath ~= "" then table.insert(pathEntries, currentPath) end
+	table.insert(pathEntries, "/usr/bin")
+	table.insert(pathEntries, "/bin")
+	local envPath = table.concat(pathEntries, ":")
 	building = true
 	table.insert(waiters, cb)
 	local finished = false
@@ -70,52 +98,8 @@ function backend.ensure(cb: (string?, string?) -> ())
 			if not ok then tern.log.error("Project backend waiter failed: " .. tostring(failure)) end
 		end
 	end
-	local windows = tern.runtime.os == "windows"
-	local name = if windows then "cargo.exe" else "cargo"
-	local candidates = {}
-	-- Check PATH before fallback locations so an active toolchain (e.g. Nix or
-	-- a custom Rust installation) is not overridden by ~/.cargo or Homebrew.
-	for directory in (tern.getenv("PATH") or ""):gmatch(if windows then "[^;]+" else "[^:]+") do
-		if windows then directory = directory:gsub('^"(.*)"$', "%1") end
-		-- Resolve only absolute entries; do not search the plugin's working directory.
-		if directory:sub(1, 1) == "/" or (windows and (directory:match("^%a:[/\\]") or directory:sub(1, 2) == "\\\\")) then
-			table.insert(candidates, directory .. "/" .. name)
-		end
-	end
-	local home = tern.getenv("HOME") or tern.getenv("USERPROFILE") or ""
-	local cargoHome = tern.getenv("CARGO_HOME") or (if home ~= "" then home .. "/.cargo" else "")
-	if cargoHome ~= "" then table.insert(candidates, cargoHome .. "/bin/" .. name) end
-	-- Rust isn't always under PATH or CARGO_HOME (e.g. Homebrew or distro packages).
-	if not windows then
-		for _, directory in { "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin" } do
-			table.insert(candidates, directory .. "/" .. name)
-		end
-	end
-	local cargo = name
-	for _, candidate in candidates do
-		if tern.fs.exists(candidate) then
-			cargo = candidate
-			break
-		end
-	end
-	-- `tern.process.run` extends the inherited environment with `env`. Add the
-	-- resolved Cargo directory to PATH so Cargo can locate `rustc` and sibling
-	-- tools even when that installation isn't on the inherited PATH.
-	local pathSep = if windows then ";" else ":"
-	local cargoDir = cargo:match("^(.+)[/\\][^/\\]*$") or ""
-	-- Keep the plugin's PATH and system tools for compilers/linkers without
-	-- introducing empty PATH segments.
-	local pathEntries = {}
-	if cargoDir ~= "" then table.insert(pathEntries, cargoDir) end
-	local currentPath = tern.getenv("PATH") or ""
-	if currentPath ~= "" then table.insert(pathEntries, currentPath) end
-	if not windows then
-		table.insert(pathEntries, "/usr/bin")
-		table.insert(pathEntries, "/bin")
-	end
-	local envPath = table.concat(pathEntries, pathSep)
-	local function compile(env: { [string]: string }?)
-		local started, err = pcall(tern.process.run, { cargo, "build", "--release", "--locked", "--manifest-path", tern.plugin.dir .. "/indexer/Cargo.toml", "--target-dir", root }, { timeout_ms = 1200000, env = env }, function(result)
+	local function compile(env: { [string]: string })
+		local started, err = pcall(tern.process.run, { cargo, "build", "--release", "--locked", "--manifest-path", indexer .. "/Cargo.toml" }, { timeout_ms = 1200000, env = env }, function(result)
 			if finished then return end
 			if result.status ~= 0 or result.timed_out then
 				tern.log.error("Cargo build output:\n" .. result.stdout .. result.stderr)
@@ -129,11 +113,25 @@ function backend.ensure(cb: (string?, string?) -> ())
 			if not saved then finish(nil, "Cannot save backend build state: " .. tostring(saveErr)); return end
 			finish(executable, nil)
 		end)
-		if not started then finish(nil, "Cannot start Cargo. Check your Rust installation, then Refresh to retry: " .. tostring(err)) end
+		if not started then finish(nil, "Cannot start mbx Cargo. Check mbx, then Refresh to retry: " .. tostring(err)) end
 	end
-	local started, err = pcall(function()
+	-- mbx-check gates every build with the same environment Cargo will see.
+	local function precheck(env: { [string]: string })
+		local started, err = pcall(tern.process.run, { check, indexer }, { timeout_ms = 60000, env = env }, function(result)
+			if finished then return end
+			if result.status ~= 0 or result.timed_out then
+				local output = result.stdout .. result.stderr
+				tern.log.error("mbx-check refused backend build:\n" .. output)
+				local detail = if result.timed_out then "mbx-check timed out after 60 seconds." else output
+				finish(nil, "mbx-check refused the backend build. " .. detail .. "\nRefresh to retry.")
+				return
+			end
+			compile(env)
+		end)
+		if not started then finish(nil, "Cannot start mbx-check. Check mbx, then Refresh to retry: " .. tostring(err)) end
+	end
+	local function prepare()
 		tern.fs.mkdir(root)
-		if tern.runtime.os ~= "macos" then compile(if envPath ~= "" then { PATH = envPath } else nil); return end
 		-- Keep the SDK and compiler in the selected Apple toolchain, not a mix
 		-- of PATH's cc/linker and a newer Command Line Tools SDK chosen by rustc.
 		tern.process.run({ "/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path" }, { timeout_ms = 10000 }, function(result)
@@ -144,7 +142,7 @@ function backend.ensure(cb: (string?, string?) -> ())
 				finish(nil, "Cannot select a macOS SDK. Install or select Apple developer tools, then Refresh to retry. " .. detail)
 				return
 			end
-			compile({
+			precheck({
 				SDKROOT = sdk,
 				CC = "/usr/bin/clang",
 				PATH = envPath,
@@ -152,8 +150,22 @@ function backend.ensure(cb: (string?, string?) -> ())
 				CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER = "/usr/bin/clang",
 			})
 		end)
+	end
+	-- mbx-check canonicalizes its argument; Cargo must receive that same path
+	-- or a linked plugin can create a second target owner for one checkout.
+	local started, err = pcall(tern.process.run, { "/bin/realpath", indexer }, { timeout_ms = 10000 }, function(result)
+		if finished then return end
+		local resolved = result.stdout:gsub("[\r\n]+$", "")
+		if result.status ~= 0 or result.timed_out or resolved:sub(1, 1) ~= "/" then
+			finish(nil, "Cannot resolve the backend workspace. " .. result.stderr .. "\nRefresh to retry.")
+			return
+		end
+		indexer = resolved
+		executable = indexer .. "/target/release/tern-projects"
+		local ok, failure = pcall(prepare)
+		if not ok then finish(nil, "Cannot prepare backend build: " .. tostring(failure)) end
 	end)
-	if not started then finish(nil, "Cannot prepare backend build: " .. tostring(err)) end
+	if not started then finish(nil, "Cannot resolve backend workspace: " .. tostring(err)) end
 end
 
 return backend
